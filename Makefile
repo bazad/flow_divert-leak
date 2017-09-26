@@ -15,6 +15,8 @@ CODESIGN := codesign
 
 CFLAGS = -O2 -Wall -Werror -Wpedantic -Wno-gnu
 
+FRAMEWORKS = -framework Foundation -framework IOKit
+
 SOURCES = $(TARGET).c
 
 HEADERS =
@@ -22,7 +24,7 @@ HEADERS =
 all: $(TARGET)
 
 $(TARGET): $(SOURCES) $(HEADERS)
-	$(CC) $(CFLAGS) $(DEFINES) -o $@ $(SOURCES)
+	$(CC) $(CFLAGS) $(FRAMEWORKS) $(DEFINES) -o $@ $(SOURCES)
 	$(CODESIGN) -s - $@
 
 clean:
